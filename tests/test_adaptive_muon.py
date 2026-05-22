@@ -19,10 +19,12 @@ import torch.nn as nn
 from absl import flags, logging
 from absl.testing import absltest, parameterized
 
+from emerging_optimizers import utils
 from emerging_optimizers.orthogonalized_optimizers.adaptive_muon import (
     AdaptiveMuon,
     Moment2MethodT,
 )
+from emerging_optimizers.orthogonalized_optimizers.muon import get_muon_scale_factor
 
 
 flags.DEFINE_enum("device", "cpu", ["cpu", "cuda"], "Device to run tests on")
@@ -100,6 +102,120 @@ class AdaptiveMuonTest(parameterized.TestCase):
             self.assertEqual(list(moment2.shape), expected_shape)
         elif moment2_method == "namo":
             self.assertEqual(moment2.shape, torch.Size([1]))
+
+    @parameterized.parameters(
+        *({"moment2_method": moment2_method} for moment2_method in MOMENT2_METHODS),
+    )
+    def test_moment2_accumulates_before_muon_update_scaling(self, moment2_method) -> None:
+        """Test that Muon update scaling is applied after second-moment normalization."""
+        shape = (4, 16)
+        initial_param = torch.randn(shape, dtype=torch.float32, device=FLAGS.device)
+        grad = torch.randn_like(initial_param)
+
+        spectral_param = nn.Parameter(initial_param.clone())
+        spectral_param.grad = grad.clone()
+        spectral_opt = AdaptiveMuon(
+            [spectral_param],
+            lr=0.01,
+            momentum=0.0,
+            weight_decay=0.0,
+            moment2_method=moment2_method,
+            beta2=0.0,
+            scale_mode="spectral",
+            fp32_matmul_prec="highest",
+        )
+
+        shape_scaled_param = nn.Parameter(initial_param.clone())
+        shape_scaled_param.grad = grad.clone()
+        shape_scaled_opt = AdaptiveMuon(
+            [shape_scaled_param],
+            lr=0.01,
+            momentum=0.0,
+            weight_decay=0.0,
+            moment2_method=moment2_method,
+            beta2=0.0,
+            scale_mode="shape_scaling",
+            fp32_matmul_prec="highest",
+        )
+
+        spectral_opt.step()
+        shape_scaled_opt.step()
+
+        torch.testing.assert_close(
+            spectral_opt.state[spectral_param]["moment2_buffer"],
+            shape_scaled_opt.state[shape_scaled_param]["moment2_buffer"],
+            atol=0.0,
+            rtol=0.0,
+        )
+        expected_scale_ratio = get_muon_scale_factor(*shape, mode="spectral") / get_muon_scale_factor(
+            *shape, mode="shape_scaling"
+        )
+        torch.testing.assert_close(
+            initial_param - spectral_param.detach(),
+            (initial_param - shape_scaled_param.detach()) * expected_scale_ratio,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    @parameterized.parameters({"shape": (16, 4)}, {"shape": (4, 16)})
+    def test_normuon_step_preserves_pre_scale_frobenius_norm(self, shape) -> None:
+        """Test that NorMuon preserves the raw orthogonalized update scale through step()."""
+
+        factors = torch.tensor([1.0] * 4 + [2.0] * 11 + [4.0], device=FLAGS.device)
+        if shape[-2] >= shape[-1]:
+            grad = factors[:, None].expand(shape).clone()
+        else:
+            grad = factors[None, :].expand(shape).clone()
+
+        lr = 0.125  # Power-of-two LR keeps update recovery from the param delta exact.
+        test_param = nn.Parameter(torch.zeros(shape, dtype=torch.float32, device=FLAGS.device))
+        adaptive_opt = AdaptiveMuon(
+            [test_param],
+            lr=lr,
+            momentum=0.0,
+            weight_decay=0.0,
+            moment2_method="normuon",
+            beta2=0.0,
+            scale_mode="spectral",
+            fp32_matmul_prec="highest",
+        )
+        eps = adaptive_opt.param_groups[0]["eps"]
+        scale_factor = get_muon_scale_factor(*shape, mode="spectral")
+
+        for beta2 in (0.0, 0.5):
+            adaptive_opt.param_groups[0]["beta2"] = beta2
+            test_param.grad = grad.clone()
+            group_kwargs = {k: v for k, v in adaptive_opt.param_groups[0].items() if k != "params"}
+            with utils.fp32_matmul_precision(adaptive_opt.fp32_matmul_prec):
+                orth_grad = adaptive_opt.orthogonalize(test_param, test_param.grad, **group_kwargs)
+
+            avg_dim = -1 if orth_grad.shape[-2] >= orth_grad.shape[-1] else -2
+            expected_moment2 = orth_grad.square().mean(dim=avg_dim, keepdim=True)
+            step_size = expected_moment2.clamp_min(eps).rsqrt_()
+            normalized_update = orth_grad * step_size
+            expected_pre_scale_update = normalized_update * (
+                torch.linalg.vector_norm(orth_grad) / torch.linalg.vector_norm(normalized_update).clamp_min(eps)
+            )
+            expected_update = expected_pre_scale_update * scale_factor
+            param_before_step = test_param.detach().clone()
+
+            adaptive_opt.step()
+
+            state = adaptive_opt.state[test_param]
+            self.assertIn("moment2_buffer", state)
+            torch.testing.assert_close(
+                state["moment2_buffer"],
+                expected_moment2,
+                atol=0.0,
+                rtol=0.0,
+            )
+            applied_update = (param_before_step - test_param.detach()) / lr
+            torch.testing.assert_close(
+                applied_update,
+                expected_update,
+                atol=0.0,
+                rtol=0.0,
+            )
 
     @parameterized.parameters(
         *({"moment2_method": moment2_method} for moment2_method in MOMENT2_METHODS),
